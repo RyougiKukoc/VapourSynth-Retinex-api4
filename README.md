@@ -168,7 +168,7 @@ meson build
 ninja -C build
 ```
 
-## Windows Package Build
+## Release Package Build
 
 The MSYS2/UCRT64 CI path builds a VapourSynth R77 API4 package directory:
 
@@ -191,26 +191,38 @@ python tools\smoke_load_artifact.py --vapoursynth-root _deps\vapoursynth-wheel-R
 python tools\package_plugin_zip.py --input-dir dist\msys2-ucrt64 --output dist\retinex-msys2-ucrt64.zip
 ```
 
+The Linux x86_64 release payload has the same top-level directory shape, using
+`retinex.so`. It is compiled in a manylinux2014 container and is published with
+a `manylinux_2_27_x86_64` wheel tag because VapourSynth R79 sets the effective
+runtime baseline. Retinex has no additional Linux runtime libraries.
+
 ## pip / Git Install
 
-The Windows release workflow also builds a wheel that installs the plugin under
-`site-packages/vapoursynth/plugins/retinex/`.
+The Windows and Linux x86_64 release workflows build wheels that install the
+plugin under `site-packages/vapoursynth/plugins/retinex/`.
 
 After the matching GitHub Release assets are published, users can install from
 the repository with:
 
-```powershell
+```text
 pip install "vapoursynth-retinex @ git+https://github.com/RyougiKukoc/VapourSynth-Retinex-api4.git"
 ```
 
-The package version is `4`, so the default source-install lookup expects:
+The package version is `4.1`, so the default source-install lookup expects the
+matching platform payload at tag `v4.1`:
 
 ```text
-https://github.com/RyougiKukoc/VapourSynth-Retinex-api4/releases/download/v4/retinex-msys2-ucrt64.zip
+Windows: https://github.com/RyougiKukoc/VapourSynth-Retinex-api4/releases/download/v4.1/retinex-msys2-ucrt64.zip
+Linux x86_64: https://github.com/RyougiKukoc/VapourSynth-Retinex-api4/releases/download/v4.1/retinex-linux-x86_64.zip
 ```
 
-During a Windows x86_64 source install, `hatch_build.py` first tries to reuse
-that tested release zip. If the asset is unavailable, it falls back to a local
-MSYS2/Meson build. For local testing or custom mirrors, set
-`RETINEX_PREBUILT_URL` to a release zip path or URL. Set `RETINEX_FORCE_BUILD=1`
-to skip the prebuilt asset and force a local build.
+During a Windows or Linux x86_64 source install, `hatch_build.py` first tries
+to reuse the matching tested release zip. On every other platform, or when an
+asset is unavailable, it executes a native Meson build. Linux and macOS never
+run the MSYS2 preparation scripts. The isolated PEP 517 build environment
+includes a VapourSynth R79-compatible SDK wheel and prepends its
+`vapoursynth/pkgconfig` directory to an existing `PKG_CONFIG_PATH`.
+
+For local testing or custom mirrors, set `RETINEX_PREBUILT_URL` to a release
+zip path or URL. Set `RETINEX_FORCE_BUILD=1` to skip the prebuilt asset and
+force a local build with a compatible SDK and toolchain.

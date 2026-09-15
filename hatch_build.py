@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import platform
+import importlib.util
+import shlex
 import shutil
 import subprocess
 import sys
@@ -20,7 +22,8 @@ ROOT = Path(__file__).resolve().parent
 PLUGIN_NAME = "retinex"
 PACKAGE_NAME = "Retinex"
 DEFAULT_REPOSITORY = "RyougiKukoc/VapourSynth-Retinex-api4"
-DEFAULT_PREBUILT_ASSET = "retinex-msys2-ucrt64.zip"
+WINDOWS_PREBUILT_ASSET = "retinex-msys2-ucrt64.zip"
+LINUX_PREBUILT_ASSET = "retinex-linux-x86_64.zip"
 
 
 def _truthy(value: str | None) -> bool:
@@ -39,10 +42,16 @@ def _project_version() -> str:
     return version
 
 
+def _default_prebuilt_asset() -> str:
+    if sys.platform == "linux" and platform.machine().lower() in {"amd64", "x86_64"}:
+        return LINUX_PREBUILT_ASSET
+    return WINDOWS_PREBUILT_ASSET
+
+
 def _default_prebuilt_url(version: str) -> str:
     repository = os.environ.get("RETINEX_PREBUILT_REPOSITORY") or os.environ.get("GITHUB_REPOSITORY") or DEFAULT_REPOSITORY
     tag = os.environ.get("RETINEX_PREBUILT_TAG") or f"v{version}"
-    asset = os.environ.get("RETINEX_PREBUILT_ASSET_NAME") or DEFAULT_PREBUILT_ASSET
+    asset = os.environ.get("RETINEX_PREBUILT_ASSET_NAME") or _default_prebuilt_asset()
     return f"https://github.com/{repository}/releases/download/{tag}/{asset}"
 
 
@@ -54,7 +63,15 @@ def _prebuilt_source(version: str) -> tuple[str, bool]:
 
 
 def _supports_prebuilt() -> bool:
-    return sys.platform == "win32" and platform.machine().lower() in {"amd64", "x86_64"}
+    return sys.platform in {"win32", "linux"} and platform.machine().lower() in {"amd64", "x86_64"}
+
+
+def _plugin_filename() -> str:
+    if sys.platform == "win32":
+        return f"{PLUGIN_NAME}.dll"
+    if sys.platform == "darwin":
+        return f"{PLUGIN_NAME}.dylib"
+    return f"{PLUGIN_NAME}.so"
 
 
 def _fetch_prebuilt_archive(source: str, destination: Path) -> None:
@@ -62,7 +79,6 @@ def _fetch_prebuilt_archive(source: str, destination: Path) -> None:
     if candidate.exists():
         shutil.copy2(candidate, destination)
         return
-
     request = urllib.request.Request(source, headers={"User-Agent": "vapoursynth-retinex-build-hook"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as handle:
         shutil.copyfileobj(response, handle)
@@ -80,13 +96,11 @@ def _write_manifest(target_dir: Path) -> None:
 def _stage_package_from_zip(archive_path: Path, target_dir: Path) -> None:
     with zipfile.ZipFile(archive_path) as zf:
         package_members = [
-            name
-            for name in zf.namelist()
+            name for name in zf.namelist()
             if name.replace("\\", "/").startswith(f"{PLUGIN_NAME}/") and not name.endswith("/")
         ]
         if not package_members:
             raise FileNotFoundError(f"prebuilt archive does not contain a {PLUGIN_NAME}/ package directory")
-
         for member in package_members:
             normalized = member.replace("\\", "/")
             relative = normalized.split("/", 1)[1]
@@ -94,10 +108,9 @@ def _stage_package_from_zip(archive_path: Path, target_dir: Path) -> None:
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as src, out_path.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
-
-    plugin_dll = target_dir / f"{PLUGIN_NAME}.dll"
-    if not plugin_dll.exists():
-        raise FileNotFoundError(f"prebuilt archive did not provide {PLUGIN_NAME}.dll")
+    plugin = target_dir / _plugin_filename()
+    if not plugin.exists():
+        raise FileNotFoundError(f"prebuilt archive did not provide {_plugin_filename()}")
     if not (target_dir / "manifest.vs").exists():
         _write_manifest(target_dir)
 
@@ -107,11 +120,10 @@ def _stage_prebuilt_plugin(version: str, target_dir: Path) -> bool:
         print(f"{PACKAGE_NAME} wheel build: skipping prebuilt asset because RETINEX_FORCE_BUILD is set")
         return False
     if not _supports_prebuilt():
-        print(f"{PACKAGE_NAME} wheel build: prebuilt release asset path only applies to Windows x86_64; falling back to local build")
+        print(f"{PACKAGE_NAME} wheel build: no matching platform release asset; falling back to local build")
         return False
-
     source, explicit = _prebuilt_source(version)
-    asset_name = Path(source).name or DEFAULT_PREBUILT_ASSET
+    asset_name = Path(source).name or _default_prebuilt_asset()
     try:
         with tempfile.TemporaryDirectory(prefix="retinex-prebuilt-") as temp_dir_text:
             archive_path = Path(temp_dir_text) / asset_name
@@ -122,7 +134,6 @@ def _stage_prebuilt_plugin(version: str, target_dir: Path) -> bool:
             raise RuntimeError(f"failed to use explicit {PACKAGE_NAME} prebuilt asset {source!r}") from exc
         print(f"{PACKAGE_NAME} wheel build: prebuilt asset unavailable at {source}; falling back to local build ({exc})")
         return False
-
     print(f"{PACKAGE_NAME} wheel build: using prebuilt release asset {source}")
     return True
 
@@ -134,14 +145,44 @@ def _run(cmd: list[str], *, env: dict[str, str]) -> None:
 
 def _prepend_path_entries(env: dict[str, str], entries: list[Path]) -> None:
     parts = [str(entry) for entry in entries if entry.exists()]
-    if not parts:
-        return
-    existing = env.get("PATH")
-    env["PATH"] = os.pathsep.join(parts + ([existing] if existing else []))
+    if parts:
+        existing = env.get("PATH")
+        env["PATH"] = os.pathsep.join(parts + ([existing] if existing else []))
 
 
-def _configure_windows_build_env(env: dict[str, str]) -> dict[str, str]:
+def _configure_build_env(env: dict[str, str]) -> dict[str, str]:
     if sys.platform != "win32":
+        header_dir: Path | None = None
+        spec = importlib.util.find_spec("vapoursynth")
+        if spec is not None and spec.origin is not None:
+            pkgconfig_dir = Path(spec.origin).resolve().parent / "pkgconfig"
+            if not pkgconfig_dir.is_dir():
+                raise FileNotFoundError(f"VapourSynth pkg-config metadata is missing: {pkgconfig_dir}")
+            existing = env.get("PKG_CONFIG_PATH")
+            env["PKG_CONFIG_PATH"] = os.pathsep.join([str(pkgconfig_dir), *([existing] if existing else [])])
+            header_dir = pkgconfig_dir.parent / "include"
+        if header_dir is None:
+            pkg_config = env.get("PKG_CONFIG", "pkg-config")
+            result = subprocess.run(
+                [pkg_config, "--variable=includedir", "vapoursynth"],
+                capture_output=True,
+                check=False,
+                env=env,
+                text=True,
+            )
+            if result.returncode == 0:
+                header_dir = Path(result.stdout.strip())
+        if header_dir is None or not (header_dir / "VapourSynth4.h").is_file():
+            raise RuntimeError("native Retinex builds require the VapourSynth SDK wheel or vapoursynth.pc")
+
+        # The Linux wheel installs flat headers while Retinex deliberately uses
+        # the cross-platform <vapoursynth/...> include form. Stage a private
+        # include root instead of changing the installed wheel.
+        shim_root = ROOT / "build-wheel-sdk"
+        shutil.rmtree(shim_root, ignore_errors=True)
+        shutil.copytree(header_dir, shim_root / "vapoursynth")
+        existing_flags = env.get("CXXFLAGS")
+        env["CXXFLAGS"] = " ".join([f"-I{shlex.quote(str(shim_root))}", *([existing_flags] if existing_flags else [])])
         return env
 
     msystem_prefix = env.get("MSYSTEM_PREFIX")
@@ -152,47 +193,76 @@ def _configure_windows_build_env(env: dict[str, str]) -> dict[str, str]:
     else:
         path_entries.extend([Path(r"C:\msys64\ucrt64\bin"), Path(r"C:\msys64\usr\bin")])
     _prepend_path_entries(env, path_entries)
-
     env.setdefault("CC", "gcc")
     env.setdefault("CXX", "g++")
     return env
 
 
+def _meson_command() -> list[str]:
+    meson = shutil.which("meson")
+    if meson:
+        return [meson]
+    for module in ("mesonbuild", "mesonbuild.mesonmain"):
+        command = [sys.executable, "-m", module]
+        if subprocess.run(command + ["--version"], cwd=ROOT, capture_output=True).returncode == 0:
+            return command
+    raise FileNotFoundError("Meson is not available in the build environment")
+
+
+def _find_built_plugin(build_dir: Path) -> Path:
+    suffixes = [".dll"] if sys.platform == "win32" else [".so", ".dylib"]
+    for suffix in suffixes:
+        for stem in (PLUGIN_NAME, f"lib{PLUGIN_NAME}"):
+            candidate = build_dir / f"{stem}{suffix}"
+            if candidate.exists():
+                return candidate
+    raise FileNotFoundError(f"missing built plugin under {build_dir}")
+
+
 def _stage_local_build(target_dir: Path) -> None:
-    env = _configure_windows_build_env(os.environ.copy())
-    build_dir = ROOT / "build-wheel-msys2"
-    plugins_root = target_dir.parent
-    _run([sys.executable, "tools/ci_prepare_msys2.py"], env=env)
-    _run(
-        [
-            sys.executable,
-            "tools/ci_build_msys2.py",
-            "--clean",
-            "--build-dir",
-            str(build_dir),
-            "--dist-dir",
-            str(plugins_root),
-        ],
-        env=env,
-    )
-    if not (target_dir / f"{PLUGIN_NAME}.dll").exists():
-        raise FileNotFoundError(target_dir / f"{PLUGIN_NAME}.dll")
+    env = _configure_build_env(os.environ.copy())
+    if sys.platform == "win32":
+        build_dir = ROOT / "build-wheel-msys2"
+        _run([sys.executable, "tools/ci_prepare_msys2.py"], env=env)
+        _run(
+            [
+                sys.executable,
+                "tools/ci_build_msys2.py",
+                "--clean",
+                "--build-dir",
+                str(build_dir),
+                "--dist-dir",
+                str(target_dir.parent),
+            ],
+            env=env,
+        )
+        if not (target_dir / _plugin_filename()).is_file():
+            raise FileNotFoundError(target_dir / _plugin_filename())
+        return
+    meson = _meson_command()
+    build_dir = ROOT / "build-wheel"
+    _run(meson + ["setup", str(build_dir), "--wipe"], env=env)
+    _run(meson + ["compile", "-C", str(build_dir)], env=env)
+    plugin = _find_built_plugin(build_dir)
+    shutil.copy2(plugin, target_dir / _plugin_filename())
+    _write_manifest(target_dir)
 
 
 class CustomHook(BuildHookInterface[Any]):
-    build_dir = ROOT / "build-wheel-msys2"
+    build_dir = ROOT / "build-wheel"
     dist_dir = ROOT / "vapoursynth" / "plugins" / PLUGIN_NAME
 
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         del version
         build_data["pure_python"] = False
-        build_data["tag"] = f"py3-none-{next(tags.platform_tags())}"
+        platform_tag = os.environ.get("RETINEX_PLATFORM_TAG") or str(next(tags.platform_tags()))
+        build_data["tag"] = f"py3-none-{platform_tag}"
         project_version = _project_version()
-
         shutil.rmtree(self.build_dir, ignore_errors=True)
+        shutil.rmtree(ROOT / "build-wheel-msys2", ignore_errors=True)
+        shutil.rmtree(ROOT / "build-wheel-sdk", ignore_errors=True)
         shutil.rmtree(self.dist_dir.parent.parent, ignore_errors=True)
         self.dist_dir.mkdir(parents=True, exist_ok=True)
-
         if not _stage_prebuilt_plugin(project_version, self.dist_dir):
             _stage_local_build(self.dist_dir)
 
@@ -200,3 +270,4 @@ class CustomHook(BuildHookInterface[Any]):
         del version, build_data, artifact_path
         shutil.rmtree(self.build_dir, ignore_errors=True)
         shutil.rmtree(self.dist_dir.parent.parent, ignore_errors=True)
+        shutil.rmtree(ROOT / "build-wheel-sdk", ignore_errors=True)
